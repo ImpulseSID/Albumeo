@@ -1,57 +1,81 @@
+import { queryParser } from "./queryParser";
+import { searchStrategyService } from "./searchStrategy";
 import { musicbrainzService } from "./musicbrainzService";
-import { dataTransformService } from "./dataTransformService";
 import type { Album } from "./dataTransformService";
 
 class MusicService {
   async searchAlbums(query: string, limit: number = 25): Promise<Album[]> {
     try {
-      // Search for releases (albums) directly
-      const releases = await musicbrainzService.searchReleases(query, limit);
-      const directAlbums =
-        dataTransformService.transformReleasesToAlbums(releases);
+      console.log("Starting intelligent search for:", query);
 
-      // Also search for recordings (songs) and extract their albums
-      const recordings = await musicbrainzService.searchRecordings(
-        query,
-        limit
-      );
-      const tracksWithAlbums =
-        dataTransformService.transformRecordingsToTracks(recordings);
+      // Parse the query to understand intent
+      const parsedQuery = queryParser.parseQuery(query);
+      console.log("Parsed query:", parsedQuery);
 
-      // Extract unique albums from the tracks
-      const albumsFromTracks: Album[] = [];
-      const seenAlbumIds = new Set<string>();
+      const allResults: Array<{ albums: Album[]; confidence: number }> = [];
 
-      tracksWithAlbums.forEach((track) => {
-        if (track.album && !seenAlbumIds.has(track.album.id)) {
-          seenAlbumIds.add(track.album.id);
-          albumsFromTracks.push({
-            id: track.album.id,
-            name: track.album.title,
-            artist: track.artist.name,
-            artistId: track.artist.id,
-            url: `https://musicbrainz.org/release/${track.album.id}`,
-            image: [track.album.id],
-            releaseDate: undefined, // Will be populated if available
+      // Execute search strategies in order of preference
+      for (const strategy of parsedQuery.searchStrategies) {
+        console.log(`Trying strategy: ${strategy}`);
+
+        const result = await searchStrategyService.executeStrategy(
+          parsedQuery,
+          strategy,
+          limit
+        );
+
+        console.log(
+          `Strategy ${strategy} returned ${result.albums.length} albums with confidence ${result.confidence}`
+        );
+
+        if (result.albums.length > 0) {
+          allResults.push({
+            albums: result.albums,
+            confidence: result.confidence,
           });
+
+          // If we get high confidence results, we can stop early
+          if (result.confidence >= 0.8 && result.albums.length >= 5) {
+            console.log("High confidence results found, stopping early");
+            break;
+          }
         }
-      });
+      }
 
-      // Combine and deduplicate results, prioritizing direct album matches
-      const allAlbums = [...directAlbums, ...albumsFromTracks];
-      const uniqueAlbums = new Map<string, Album>();
+      // Combine and score results
+      const combinedResults = this.combineAndScoreResults(allResults);
+      const finalResults = combinedResults.slice(0, limit);
 
-      allAlbums.forEach((album) => {
-        if (!uniqueAlbums.has(album.id)) {
-          uniqueAlbums.set(album.id, album);
-        }
-      });
+      console.log(`Final results: ${finalResults.length} albums`);
 
-      return Array.from(uniqueAlbums.values()).slice(0, limit);
+      return finalResults;
     } catch (error) {
-      console.error("Error searching albums:", error);
+      console.error("Error in intelligent search:", error);
       return [];
     }
+  }
+
+  private combineAndScoreResults(
+    results: Array<{ albums: Album[]; confidence: number }>
+  ): Album[] {
+    const albumScores = new Map<string, { album: Album; score: number }>();
+
+    results.forEach(({ albums, confidence }) => {
+      albums.forEach((album, index) => {
+        const positionScore = 1 - (index / albums.length) * 0.3; // Position matters
+        const finalScore = confidence * positionScore;
+
+        const existing = albumScores.get(album.id);
+        if (!existing || existing.score < finalScore) {
+          albumScores.set(album.id, { album, score: finalScore });
+        }
+      });
+    });
+
+    // Sort by score and return albums
+    return Array.from(albumScores.values())
+      .sort((a, b) => b.score - a.score)
+      .map((item) => item.album);
   }
 
   getImageUrl(imageData: string[]): string {
